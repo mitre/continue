@@ -27,6 +27,10 @@ jobs:
       - name: Install root dependencies
         run: npm install
 
+      - name: Install core dependencies
+        working-directory: core
+        run: npm install
+
       - name: Build packages
         run: node ./scripts/build-packages.js
 
