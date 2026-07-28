@@ -17,7 +17,11 @@ let geminiPort: number;
 let proxyPort: number;
 
 /** Requests the stub Gemini server actually received. */
-const geminiRequests: { url: string; apiKey: string | undefined }[] = [];
+const geminiRequests: {
+  url: string;
+  apiKey: string | undefined;
+  customHeader: string | undefined;
+}[] = [];
 /** Number of requests that transited the proxy. */
 let proxiedRequests = 0;
 
@@ -37,7 +41,14 @@ beforeAll(async () => {
     geminiRequests.push({
       url: req.url ?? "",
       apiKey: req.headers["x-goog-api-key"] as string | undefined,
+      customHeader: req.headers["x-custom-gateway"] as string | undefined,
     });
+    if ((req.url ?? "").includes("mbedContent")) {
+      // embedContent / batchEmbedContents — Google's real response shape
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ embeddings: [{ values: [0.25, 0.75] }] }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.write(sseChunk("Hello "));
     res.write(sseChunk("from the proxied stub", "STOP"));
@@ -107,5 +118,54 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
     expect(geminiRequests).toHaveLength(1);
     expect(geminiRequests[0].apiKey).toBe("stub-key");
     expect(geminiRequests[0].url).toContain(":streamGenerateContent");
+  });
+
+  it("delivers custom requestOptions.headers to the wire", async () => {
+    const before = geminiRequests.length;
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+      requestOptions: {
+        proxy: `http://127.0.0.1:${proxyPort}`,
+        headers: { "x-custom-gateway": "gw-credential-123" },
+      },
+    });
+
+    for await (const _chunk of api.chatCompletionStream(
+      {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )) {
+      // drain
+    }
+
+    const observed = geminiRequests[before];
+    expect(observed.customHeader).toBe("gw-credential-123");
+  });
+
+  it("routes embed through the same proxy and parses Google's real shape", async () => {
+    const proxiedBefore = proxiedRequests;
+    const requestsBefore = geminiRequests.length;
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+      requestOptions: {
+        proxy: `http://127.0.0.1:${proxyPort}`,
+      },
+    });
+
+    const result = await api.embed({
+      model: "gemini-embedding-001",
+      input: ["hello"],
+    });
+
+    expect(proxiedRequests).toBe(proxiedBefore + 1);
+    expect(geminiRequests[requestsBefore].url).toContain("mbedContent");
+    expect(result.data[0].embedding).toEqual([0.25, 0.75]);
   });
 });
