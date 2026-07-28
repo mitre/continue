@@ -365,6 +365,68 @@ describe("extractNestedGeminiError (direct vectors)", () => {
   });
 });
 
+describe("GeminiApi usage accounting", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("includes thinking tokens in completion_tokens per the OpenAI convention", async () => {
+    // Thinking models report thoughtsTokenCount separately; OpenAI-compatible
+    // usage counts reasoning inside completion_tokens, keeping the identity
+    // total_tokens === prompt_tokens + completion_tokens intact.
+    generateContentStream.mockResolvedValue(
+      (async function* () {
+        yield {
+          usageMetadata: {
+            promptTokenCount: 10,
+            candidatesTokenCount: 5,
+            thoughtsTokenCount: 20,
+            totalTokenCount: 35,
+          },
+          candidates: [
+            {
+              content: { role: "model", parts: [{ text: "hi" }] },
+              finishReason: "STOP",
+            },
+          ],
+        };
+      })(),
+    );
+
+    const { GeminiApi } = await import("../apis/Gemini.js");
+    const api = new GeminiApi({ provider: "gemini", apiKey: "k" });
+
+    let usage:
+      | {
+          prompt_tokens: number;
+          completion_tokens: number;
+          total_tokens: number;
+        }
+      | undefined;
+    for await (const chunk of api.chatCompletionStream(
+      {
+        model: "gemini-flash-latest",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )) {
+      if (chunk.usage) {
+        usage = chunk.usage;
+      }
+    }
+
+    expect(usage).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 25,
+      total_tokens: 35,
+    });
+    expect(usage!.total_tokens).toBe(
+      usage!.prompt_tokens + usage!.completion_tokens,
+    );
+  });
+});
+
 describe("GeminiApi embed (SDK-native)", () => {
   afterEach(() => {
     vi.clearAllMocks();

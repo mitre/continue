@@ -444,7 +444,11 @@ export class GeminiApi implements BaseLlmApi {
       if (chunk.usageMetadata) {
         usage = {
           prompt_tokens: chunk.usageMetadata.promptTokenCount || 0,
-          completion_tokens: chunk.usageMetadata.candidatesTokenCount || 0,
+          // OpenAI-compatible usage counts reasoning inside completion_tokens;
+          // thinking models report those separately as thoughtsTokenCount.
+          completion_tokens:
+            (chunk.usageMetadata.candidatesTokenCount || 0) +
+            (chunk.usageMetadata.thoughtsTokenCount || 0),
           total_tokens: chunk.usageMetadata.totalTokenCount || 0,
         };
       }
