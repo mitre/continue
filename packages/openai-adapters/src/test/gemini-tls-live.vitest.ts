@@ -4,21 +4,34 @@ import https from "node:https";
 import { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { TLSSocket } from "node:tls";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { GeminiApi } from "../apis/Gemini.js";
 
 /**
- * TLS behavior through the REAL @google/genai SDK and the REAL
- * customFetch/fetchwithRequestOptions stack (no mocks): a local HTTPS stub
- * Gemini server with a self-signed certificate. Certificate generation
- * mirrors packages/fetch/src/fetch.e2e.test.ts.
+ * TLS and mutual-TLS behavior through the REAL @google/genai SDK and the REAL
+ * customFetch/fetchwithRequestOptions stack (no mocks): local HTTPS stub
+ * Gemini servers backed by an openssl mini-CA. Certificate choreography
+ * adapts packages/fetch/src/fetch.e2e.test.ts and the standard openssl
+ * CA-sign recipe (see also Node core's tls-client-verify tests).
  */
 
 let tempDir: string;
-let httpsServer: https.Server;
-let httpsPort: number;
-let certPath: string;
+let tlsServer: https.Server;
+let mtlsServer: https.Server;
+let tlsPort: number;
+let mtlsPort: number;
+let caCertPath: string;
+let clientCertPath: string;
+let clientKeyPath: string;
+let clientEncryptedKeyPath: string;
+
+/** Client identities the mTLS server actually observed, per request. */
+const mtlsObserved: { authorized: boolean; cn: string | undefined }[] = [];
+
+const CLIENT_CN = "continue-mtls-client";
+const CLIENT_KEY_PASSPHRASE = "test-passphrase";
 
 function sseChunk(text: string, finishReason?: string): string {
   const candidate: Record<string, unknown> = {
@@ -31,16 +44,24 @@ function sseChunk(text: string, finishReason?: string): string {
   return `data: ${JSON.stringify({ candidates: [candidate] })}\r\n\r\n`;
 }
 
-/** Self-signed server certificate — same openssl recipe as packages/fetch. */
-function generateCertificate(dir: string): {
-  certPath: string;
-  keyPath: string;
-} {
-  const cert = path.join(dir, "server.crt");
-  const key = path.join(dir, "server.key");
-  const conf = path.join(dir, "server.conf");
+/**
+ * Mini-CA: CA keypair, a CA-signed server certificate for 127.0.0.1, and a
+ * CA-signed client certificate (plus a passphrase-encrypted copy of the
+ * client key). Same openssl toolchain as packages/fetch.
+ */
+function generateMiniCa(dir: string): void {
+  const run = (cmd: string) => execSync(cmd, { stdio: "pipe" });
+
+  // CA
+  run(`openssl genrsa -out "${path.join(dir, "ca.key")}" 2048`);
+  run(
+    `openssl req -x509 -new -key "${path.join(dir, "ca.key")}" -out "${path.join(dir, "ca.crt")}" -days 365 -subj "/C=US/O=Continue Test CA/CN=Continue Test CA"`,
+  );
+
+  // Server certificate (SAN: 127.0.0.1 / localhost), signed by the CA
+  const serverConf = path.join(dir, "server.conf");
   fs.writeFileSync(
-    conf,
+    serverConf,
     `
 [req]
 distinguished_name = req_distinguished_name
@@ -49,8 +70,6 @@ prompt = no
 
 [req_distinguished_name]
 C = US
-ST = Test
-L = Test
 O = Continue TLS Test
 CN = 127.0.0.1
 
@@ -64,47 +83,101 @@ IP.1 = 127.0.0.1
 DNS.1 = localhost
 `,
   );
-  execSync(`openssl genrsa -out "${key}" 2048`, { stdio: "pipe" });
-  execSync(
-    `openssl req -new -x509 -key "${key}" -out "${cert}" -days 365 -config "${conf}" -extensions v3_req`,
-    { stdio: "pipe" },
+  run(`openssl genrsa -out "${path.join(dir, "server.key")}" 2048`);
+  run(
+    `openssl req -new -key "${path.join(dir, "server.key")}" -out "${path.join(dir, "server.csr")}" -config "${serverConf}"`,
   );
-  return { certPath: cert, keyPath: key };
+  run(
+    `openssl x509 -req -in "${path.join(dir, "server.csr")}" -CA "${path.join(dir, "ca.crt")}" -CAkey "${path.join(dir, "ca.key")}" -CAcreateserial -out "${path.join(dir, "server.crt")}" -days 365 -extensions v3_req -extfile "${serverConf}"`,
+  );
+
+  // Client certificate (clientAuth EKU), signed by the same CA
+  const clientExt = path.join(dir, "client.ext");
+  fs.writeFileSync(clientExt, "extendedKeyUsage = clientAuth\n");
+  run(`openssl genrsa -out "${path.join(dir, "client.key")}" 2048`);
+  run(
+    `openssl req -new -key "${path.join(dir, "client.key")}" -out "${path.join(dir, "client.csr")}" -subj "/C=US/O=Continue TLS Test/CN=${CLIENT_CN}"`,
+  );
+  run(
+    `openssl x509 -req -in "${path.join(dir, "client.csr")}" -CA "${path.join(dir, "ca.crt")}" -CAkey "${path.join(dir, "ca.key")}" -CAcreateserial -out "${path.join(dir, "client.crt")}" -days 365 -extfile "${clientExt}"`,
+  );
+
+  // Passphrase-encrypted copy of the client key (schema's passphrase field)
+  run(
+    `openssl rsa -in "${path.join(dir, "client.key")}" -aes256 -passout pass:${CLIENT_KEY_PASSPHRASE} -out "${path.join(dir, "client-encrypted.key")}"`,
+  );
+}
+
+function sseHandler(
+  _req: unknown,
+  res: import("node:http").ServerResponse,
+): void {
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  res.write(sseChunk("secure ", undefined));
+  res.write(sseChunk("stream", "STOP"));
+  res.end();
 }
 
 beforeAll(async () => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-tls-test-"));
-  const generated = generateCertificate(tempDir);
-  certPath = generated.certPath;
+  generateMiniCa(tempDir);
+  caCertPath = path.join(tempDir, "ca.crt");
+  clientCertPath = path.join(tempDir, "client.crt");
+  clientKeyPath = path.join(tempDir, "client.key");
+  clientEncryptedKeyPath = path.join(tempDir, "client-encrypted.key");
 
-  httpsServer = https.createServer(
+  // Plain TLS server (no client-cert requirement)
+  tlsServer = https.createServer(
     {
-      cert: fs.readFileSync(generated.certPath),
-      key: fs.readFileSync(generated.keyPath),
+      cert: fs.readFileSync(path.join(tempDir, "server.crt")),
+      key: fs.readFileSync(path.join(tempDir, "server.key")),
     },
-    (_req, res) => {
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      res.write(sseChunk("secure ", undefined));
-      res.write(sseChunk("stream", "STOP"));
-      res.end();
+    sseHandler,
+  );
+  await new Promise<void>((resolve) =>
+    tlsServer.listen(0, "127.0.0.1", resolve),
+  );
+  tlsPort = (tlsServer.address() as AddressInfo).port;
+
+  // Mutual-TLS server: demands a client certificate signed by our CA
+  mtlsServer = https.createServer(
+    {
+      cert: fs.readFileSync(path.join(tempDir, "server.crt")),
+      key: fs.readFileSync(path.join(tempDir, "server.key")),
+      ca: fs.readFileSync(caCertPath),
+      requestCert: true,
+      rejectUnauthorized: true,
+    },
+    (req, res) => {
+      const socket = req.socket as TLSSocket;
+      const cn = socket.getPeerCertificate()?.subject?.CN;
+      mtlsObserved.push({
+        authorized: socket.authorized,
+        cn: Array.isArray(cn) ? cn[0] : cn,
+      });
+      sseHandler(req, res);
     },
   );
   await new Promise<void>((resolve) =>
-    httpsServer.listen(0, "127.0.0.1", resolve),
+    mtlsServer.listen(0, "127.0.0.1", resolve),
   );
-  httpsPort = (httpsServer.address() as AddressInfo).port;
+  mtlsPort = (mtlsServer.address() as AddressInfo).port;
 });
 
 afterAll(async () => {
-  await new Promise((resolve) => httpsServer.close(resolve));
+  await new Promise((resolve) => tlsServer.close(resolve));
+  await new Promise((resolve) => mtlsServer.close(resolve));
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-function makeApi(requestOptions: Record<string, unknown>): GeminiApi {
+function makeApi(
+  port: number,
+  requestOptions: Record<string, unknown>,
+): GeminiApi {
   return new GeminiApi({
     provider: "gemini",
     apiKey: "stub-key",
-    apiBase: `https://127.0.0.1:${httpsPort}/v1beta/`,
+    apiBase: `https://127.0.0.1:${port}/v1beta/`,
     requestOptions,
   });
 }
@@ -125,21 +198,66 @@ async function drainChat(api: GeminiApi): Promise<string> {
 }
 
 describe("Gemini TLS through the real SDK (no mocks)", () => {
-  it("rejects a self-signed server when verifySsl is on", async () => {
-    // verifySsl: true engages the wrapper; the unknown self-signed cert must
-    // fail verification — proving TLS is genuinely enforced on this path.
-    await expect(drainChat(makeApi({ verifySsl: true }))).rejects.toThrow(
-      /self-signed|self signed|unable to verify|certificate/i,
+  it("rejects a server signed by an unknown CA when verifySsl is on", async () => {
+    await expect(
+      drainChat(makeApi(tlsPort, { verifySsl: true })),
+    ).rejects.toThrow(
+      /self-signed|self signed|unable to verify|certificate|unknown ca/i,
     );
   });
 
-  it("accepts the server when its certificate is trusted via caBundlePath", async () => {
-    const content = await drainChat(makeApi({ caBundlePath: certPath }));
+  it("accepts the server when its CA is trusted via caBundlePath", async () => {
+    const content = await drainChat(
+      makeApi(tlsPort, { caBundlePath: caCertPath }),
+    );
     expect(content).toBe("secure stream");
   });
 
   it("accepts the server when verifySsl is explicitly disabled", async () => {
-    const content = await drainChat(makeApi({ verifySsl: false }));
+    const content = await drainChat(makeApi(tlsPort, { verifySsl: false }));
     expect(content).toBe("secure stream");
+  });
+});
+
+describe("Gemini mutual TLS through the real SDK (no mocks)", () => {
+  it("rejects the handshake when the server requires a client certificate and none is configured", async () => {
+    await expect(
+      drainChat(makeApi(mtlsPort, { caBundlePath: caCertPath })),
+    ).rejects.toThrow(
+      /certificate required|alert|socket hang up|ECONNRESET|EPROTO/i,
+    );
+    expect(mtlsObserved).toHaveLength(0);
+  });
+
+  it("completes the handshake and streams when clientCertificate is configured", async () => {
+    const before = mtlsObserved.length;
+    const content = await drainChat(
+      makeApi(mtlsPort, {
+        caBundlePath: caCertPath,
+        clientCertificate: { cert: clientCertPath, key: clientKeyPath },
+      }),
+    );
+
+    expect(content).toBe("secure stream");
+    const observed = mtlsObserved[before];
+    expect(observed.authorized).toBe(true);
+    expect(observed.cn).toBe(CLIENT_CN);
+  });
+
+  it("supports a passphrase-protected client key", async () => {
+    const before = mtlsObserved.length;
+    const content = await drainChat(
+      makeApi(mtlsPort, {
+        caBundlePath: caCertPath,
+        clientCertificate: {
+          cert: clientCertPath,
+          key: clientEncryptedKeyPath,
+          passphrase: CLIENT_KEY_PASSPHRASE,
+        },
+      }),
+    );
+
+    expect(content).toBe("secure stream");
+    expect(mtlsObserved[before].authorized).toBe(true);
   });
 });
