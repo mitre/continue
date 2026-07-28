@@ -1,0 +1,284 @@
+---
+title: "Using Gemini with Continue: A Developer's Guide"
+description: "Complete guide to setting up Google Gemini with Continue, covering the Gemini API and Vertex AI, model selection, roles, CLI usage, and troubleshooting"
+---
+
+Continue reaches Google's Gemini models two ways:
+
+- **Gemini API** (`gemini` provider) — an API key from Google AI Studio. Fastest to set up.
+- **Vertex AI** (`vertexai` provider) — Google Cloud, with project-level billing,
+  IAM, and data-residency controls.
+
+Both work in the IDE extensions and in the CLI. Start with the Gemini API unless
+you specifically need Google Cloud.
+
+## Prerequisites
+
+- Continue installed — an [IDE extension](/ide-extensions/install) or the [CLI](/cli/quickstart)
+- For the Gemini API: an API key from [Google AI Studio](https://aistudio.google.com/)
+- For Vertex AI: a Google Cloud project with the
+  [Vertex AI API](https://console.cloud.google.com/marketplace/product/google/aiplatform.googleapis.com)
+  enabled, and the `gcloud` CLI installed
+
+## Setting up the Gemini API
+
+<Steps>
+  <Step title="Get an API key">
+    Create a key at [Google AI Studio](https://aistudio.google.com/), then export
+    it so it stays out of your config file:
+
+    ```bash
+    export GEMINI_API_KEY=your-key-here
+    ```
+
+    To persist it, add that line to your shell profile, or create
+    `~/.continue/.env` with `GEMINI_API_KEY=your-key-here`.
+  </Step>
+
+  <Step title="Add the model to config.yaml">
+    ```yaml title="~/.continue/config.yaml"
+    name: My Config
+    version: 0.0.1
+    schema: v1
+
+    models:
+      - name: Gemini 2.5 Pro
+        provider: gemini
+        model: gemini-2.5-pro
+        apiKey: ${{ secrets.GEMINI_API_KEY }}
+        roles:
+          - chat
+          - edit
+          - apply
+    ```
+  </Step>
+
+  <Step title="Verify it works">
+    In an IDE extension, pick the model from the selector and send a message.
+
+    With the CLI:
+
+    ```bash
+    cn --config ~/.continue/config.yaml -p "Say hello"
+    ```
+  </Step>
+</Steps>
+
+## Choosing a model
+
+Google revises this lineup frequently — treat
+[Google's model list](https://ai.google.dev/gemini-api/docs/models) as the
+source of truth.
+
+| Model ID | Good for |
+|----------|----------|
+| `gemini-2.5-pro` | Complex reasoning, hard refactors, architecture questions |
+| `gemini-2.5-flash` | Everyday chat and edits; solid price-performance |
+| `gemini-2.5-flash-lite` | High-volume, cost-sensitive work |
+| `gemini-3.5-flash` | Agentic and coding tasks |
+| `gemini-3.6-flash` | Agentic and multimodal work needing speed |
+
+Preview IDs such as `gemini-3.1-pro-preview` expose newer capabilities but get
+retired on Google's schedule. Prefer a stable ID for anything you rely on.
+
+<Tip>
+  Configure more than one model and switch as needed — a Pro model for design
+  discussion, a Flash model for routine edits. Use the model selector in the IDE,
+  or `/model` in the CLI.
+</Tip>
+
+## Roles
+
+The `gemini` provider does not implement every [model role](/customize/model-roles/00-intro):
+
+| Role | Supported |
+|------|-----------|
+| `chat`, `edit`, `apply`, `summarize`, `subagent` | Yes |
+| `embed` | Yes — use a `gemini-embedding-*` model |
+| `autocomplete` | **No** |
+| `rerank` | **No** |
+
+<Warning>
+  An unsupported role fails when the role is first exercised, not when the config
+  loads — the file looks fine until autocomplete or reranking actually runs.
+</Warning>
+
+For embeddings, add a second entry:
+
+```yaml title="~/.continue/config.yaml"
+models:
+  - name: Gemini Embeddings
+    provider: gemini
+    model: gemini-embedding-2
+    apiKey: ${{ secrets.GEMINI_API_KEY }}
+    roles:
+      - embed
+```
+
+For autocomplete, pair Gemini with a provider that supports fill-in-the-middle —
+see [Autocomplete](/customize/model-roles/autocomplete).
+
+## Setting up Vertex AI
+
+Use Vertex AI when you need Google Cloud billing, IAM, or data residency.
+
+<Steps>
+  <Step title="Authenticate">
+    ```bash
+    gcloud auth application-default login
+    ```
+
+    This writes [Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc)
+    that Continue picks up automatically.
+  </Step>
+
+  <Step title="Configure the model">
+    Standard mode needs **both** `projectId` and `region`:
+
+    ```yaml title="~/.continue/config.yaml"
+    models:
+      - name: Gemini 2.5 Pro (Vertex)
+        provider: vertexai
+        model: gemini-2.5-pro
+        env:
+          projectId: my-gcp-project
+          region: us-east5
+        roles:
+          - chat
+          - edit
+          - apply
+    ```
+
+    Gemini model IDs are identical on Vertex AI and the Gemini API.
+  </Step>
+</Steps>
+
+### Express mode
+
+[Express mode](https://cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview)
+trades the Cloud setup for a plain API key:
+
+```yaml title="~/.continue/config.yaml"
+models:
+  - name: Gemini (Vertex Express)
+    provider: vertexai
+    model: gemini-2.5-pro
+    apiKey: ${{ secrets.GOOGLE_CLOUD_API_KEY }}
+```
+
+<Warning>
+  Express mode takes `apiKey` alone. Adding `region`, `projectId`, `keyFile`, or
+  `keyJson` alongside it is rejected.
+</Warning>
+
+### Service accounts
+
+For CI or a shared machine, point at a service account with **either** `keyFile`
+or `keyJson` — never both:
+
+```yaml title="~/.continue/config.yaml"
+models:
+  - name: Gemini 2.5 Pro (Vertex)
+    provider: vertexai
+    model: gemini-2.5-pro
+    env:
+      projectId: my-gcp-project
+      region: us-east5
+      keyFile: /path/to/service-account.json
+```
+
+## Behind a proxy or corporate TLS
+
+`requestOptions` covers gateway and corporate-network setups, and applies to
+chat, streaming, and embeddings alike:
+
+```yaml title="~/.continue/config.yaml"
+models:
+  - name: Gemini 2.5 Pro
+    provider: gemini
+    model: gemini-2.5-pro
+    apiKey: ${{ secrets.GEMINI_API_KEY }}
+    requestOptions:
+      proxy: http://proxy.internal:8080
+      caBundlePath: /etc/ssl/corp-bundle.pem
+```
+
+Point `apiBase` at an API gateway when one fronts the Gemini API, and use
+`requestOptions.headers` for gateway auth headers.
+
+## Using Gemini with the CLI
+
+`cn` reads the same `config.yaml`. Its first-run setup asks for an Anthropic API
+key, so pass your config explicitly to skip that prompt:
+
+```bash
+cn --config ~/.continue/config.yaml
+```
+
+Then use it as usual:
+
+```bash
+# Interactive
+cn --config ~/.continue/config.yaml
+
+# Headless
+cn --config ~/.continue/config.yaml -p "Summarize the changes on this branch"
+```
+
+<Note>
+  `--model` expects a model slug, not a provider model ID —
+  `cn --model gemini-2.5-pro` will not work. Define models in `config.yaml`.
+</Note>
+
+Your model must have the `chat` role; that is what the agent runs on.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="'Method not implemented' at runtime">
+    A role was assigned that `gemini` does not implement — almost always
+    `autocomplete` or `rerank`. Remove it, and use a different provider for that
+    role. See [Roles](#roles).
+  </Accordion>
+
+  <Accordion title="The CLI keeps asking for an Anthropic API key">
+    First-run setup prompts for one regardless of what is in your config. Pass
+    `--config ~/.continue/config.yaml` to skip it.
+  </Accordion>
+
+  <Accordion title="Quota exceeded (429 / RESOURCE_EXHAUSTED)">
+    Free-tier quotas are per-model and per-minute; the error message states the
+    exact quota hit and a retry delay. Check your usage and limits on
+    [Google's rate-limit page](https://ai.google.dev/gemini-api/docs/rate-limits),
+    or switch the model entry to a lower-cost ID (e.g. `gemini-2.5-flash-lite`)
+    while iterating.
+  </Accordion>
+
+  <Accordion title="A stale API key seems to persist">
+    The shell environment takes priority over every `.env` file. Resolution order
+    is `process.env`, then `~/.continue/.env`, then `<workspace>/.continue/.env`,
+    then `<workspace>/.env`. An exported `GEMINI_API_KEY` overrides all of them —
+    check `echo $GEMINI_API_KEY` first.
+  </Accordion>
+
+  <Accordion title="Model not found, or the model ID is rejected">
+    Google retires models, and preview IDs change. Confirm the ID against
+    [Google's model list](https://ai.google.dev/gemini-api/docs/models).
+
+    On Vertex AI, a model ID that matches none of Vertex's publishers (Google,
+    Anthropic, Mistral) is rejected as unsupported.
+  </Accordion>
+
+  <Accordion title="Vertex AI rejects the configuration">
+    The two auth modes cannot be mixed. Standard mode needs both `projectId` and
+    `region`; express mode needs `apiKey` alone. `keyFile` and `keyJson` are
+    mutually exclusive.
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+- [Gemini provider reference](/customize/model-providers/top-level/gemini)
+- [Vertex AI provider reference](/customize/model-providers/top-level/vertexai)
+- [CLI configuration](/cli/configuration)
+- [Model roles](/customize/model-roles/00-intro)

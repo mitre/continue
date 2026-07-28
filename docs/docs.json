@@ -177,6 +177,7 @@
               "guides/codebase-documentation-awareness",
               "guides/plan-mode-guide",
               "guides/ollama-guide",
+              "guides/gemini-guide",
               "guides/instinct",
               "guides/running-continue-without-internet",
               "guides/custom-code-rag",

@@ -8,6 +8,10 @@ sidebarTitle: "Gemini"
   Get an API key from [Google AI Studio](https://aistudio.google.com/)
 </Info>
 
+The `gemini` provider talks to the Gemini API at
+`https://generativelanguage.googleapis.com/v1beta/`. To reach Gemini models
+through Google Cloud instead, see [Vertex AI](/customize/model-providers/top-level/vertexai).
+
 ## Configuration
 
 <Tabs>
@@ -18,10 +22,14 @@ sidebarTitle: "Gemini"
   schema: v1
 
   models:
-    - name: <MODEL_NAME>
+    - name: Gemini 2.5 Pro
       provider: gemini
-      model: <MODEL_ID>
-      apiKey: <YOUR_GEMINI_API_KEY>
+      model: gemini-2.5-pro
+      apiKey: ${{ secrets.GEMINI_API_KEY }}
+      roles:
+        - chat
+        - edit
+        - apply
   ```
   </Tab>
   <Tab title="JSON (Deprecated)">
@@ -29,9 +37,9 @@ sidebarTitle: "Gemini"
   {
     "models": [
       {
-        "title": "<MODEL_NAME>", 
+        "title": "Gemini 2.5 Pro",
         "provider": "gemini",
-        "model": "<MODEL_ID>",
+        "model": "gemini-2.5-pro",
         "apiKey": "<YOUR_GEMINI_API_KEY>"
       }
     ]
@@ -40,3 +48,127 @@ sidebarTitle: "Gemini"
   </Tab>
 </Tabs>
 
+`apiKey` is required for this provider.
+
+<Tip>
+  Rather than putting the key in the file, store it as a `GEMINI_API_KEY`
+  environment variable and reference it with `${{ secrets.GEMINI_API_KEY }}`.
+  See [Secrets](#secrets) below.
+</Tip>
+
+## Supported roles
+
+Not every [model role](/customize/model-roles/00-intro) works with this provider.
+
+| Role | Supported | Notes |
+|------|-----------|-------|
+| `chat` | Yes | |
+| `edit` | Yes | |
+| `apply` | Yes | |
+| `summarize` | Yes | |
+| `subagent` | Yes | |
+| `embed` | Yes | Use a `gemini-embedding-*` model |
+| `autocomplete` | **No** | The provider does not implement fill-in-the-middle |
+| `rerank` | **No** | Not implemented |
+
+<Warning>
+  Assigning `autocomplete` or `rerank` to a `gemini` model fails at request time
+  with `Method not implemented`, not at config-load time — so the config looks
+  valid until the role is actually used. For reranking, configure a separate
+  provider that supports it.
+</Warning>
+
+## Models
+
+Google updates this lineup often. The
+[Gemini models page](https://ai.google.dev/gemini-api/docs/models) is the
+authoritative list; the IDs below are a starting point.
+
+### Chat
+
+| Model ID | Notes |
+|----------|-------|
+| `gemini-2.5-pro` | Strongest reasoning of the 2.5 line |
+| `gemini-2.5-flash` | Balanced price and performance |
+| `gemini-2.5-flash-lite` | Lowest cost of the 2.5 line |
+| `gemini-3.5-flash` | Strong on agentic and coding tasks |
+| `gemini-3.6-flash` | Speed with multimodal and agentic support |
+| `gemini-3.5-flash-lite` | Fastest, most cost-effective |
+
+Preview models such as `gemini-3.1-pro-preview` are also available. Preview IDs
+change and are eventually retired, so prefer a stable ID for anything long-lived.
+
+### Embeddings
+
+| Model ID | Notes |
+|----------|-------|
+| `gemini-embedding-2` | Multimodal embeddings |
+| `gemini-embedding-001` | Text embeddings |
+
+```yaml title="config.yaml"
+models:
+  - name: Gemini Embeddings
+    provider: gemini
+    model: gemini-embedding-2
+    apiKey: ${{ secrets.GEMINI_API_KEY }}
+    roles:
+      - embed
+```
+
+## Secrets
+
+Set the key as an environment variable rather than writing it into the file:
+
+```bash
+export GEMINI_API_KEY=your-key-here
+```
+
+Then reference it:
+
+```yaml title="config.yaml"
+apiKey: ${{ secrets.GEMINI_API_KEY }}
+```
+
+The CLI also reads `.env` files. It resolves a secret from the first source that
+defines it, in this order:
+
+1. `process.env` — the shell environment
+2. `~/.continue/.env`
+3. `<workspace>/.continue/.env`
+4. `<workspace>/.env`
+
+## Custom endpoints, headers, and proxies
+
+The provider honors `apiBase` and `requestOptions` on every path — chat,
+streaming, and embeddings:
+
+```yaml title="config.yaml"
+models:
+  - name: Gemini via Gateway
+    provider: gemini
+    model: gemini-2.5-pro
+    apiBase: https://gateway.example.com/v1beta/
+    apiKey: ${{ secrets.GATEWAY_API_KEY }}
+    requestOptions:
+      headers:
+        x-api-key: ${{ secrets.GATEWAY_API_KEY }}
+      timeout: 30000
+      proxy: http://proxy.internal:8080
+```
+
+- `apiBase` — point at an API gateway or regional endpoint
+- `requestOptions.headers` — custom headers (e.g. gateway auth)
+- `requestOptions.timeout` — request timeout in milliseconds
+- `requestOptions.proxy`, `verifySsl`, `caBundlePath`, `clientCertificate` —
+  proxying and TLS configuration for corporate networks
+
+## Using Gemini with the CLI
+
+`cn` reads the same `config.yaml`. Because its first-run setup asks specifically
+for an Anthropic API key, point it at your config explicitly the first time:
+
+```bash
+cn --config ~/.continue/config.yaml
+```
+
+See [CLI configuration](/cli/configuration) for details.

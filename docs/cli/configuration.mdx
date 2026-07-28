@@ -32,6 +32,43 @@ This shows your available local configs. The selection is saved for next time.
 
 `cn` looks for `~/.continue/config.yaml`. This file uses the same format as the IDE extensions — see [config.yaml reference](/customize/deep-dives/configuration) for the full schema.
 
+## Using a provider other than Anthropic
+
+First-run setup asks for an Anthropic API key. To use a different provider —
+[Gemini](/customize/model-providers/top-level/gemini),
+[Vertex AI](/customize/model-providers/top-level/vertexai),
+[OpenAI](/customize/model-providers/top-level/openai), or any other — write a
+`config.yaml` and pass it with `--config`, which skips that prompt:
+
+```yaml title="~/.continue/config.yaml"
+name: My Config
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Gemini 2.5 Pro
+    provider: gemini
+    model: gemini-2.5-pro
+    apiKey: ${{ secrets.GEMINI_API_KEY }}
+    roles:
+      - chat
+      - edit
+      - apply
+```
+
+```bash
+export GEMINI_API_KEY=your-key-here
+cn --config ~/.continue/config.yaml
+```
+
+<Note>
+  `--model` takes a model slug, not a raw model ID from a provider. To use a
+  specific provider model, define it in `config.yaml` as above.
+</Note>
+
+Your model needs the `chat` role — that is what the agent runs on. Check the
+provider's page first, since not every provider implements every role.
+
 ## CLI-specific flags
 
 Several flags inject configuration at launch without editing a file:
@@ -54,3 +91,14 @@ Store sensitive values (API keys, tokens) as environment variables. Reference th
 ```yaml
 ${{ secrets.MY_API_KEY }}
 ```
+
+`cn` also reads `.env` files. A secret is resolved from the first source that
+defines it:
+
+1. `process.env` — the shell environment
+2. `~/.continue/.env`
+3. `<workspace>/.continue/.env`
+4. `<workspace>/.env`
+
+Because the shell environment wins, an exported variable overrides the same key
+in any `.env` file — worth checking first when a stale key seems to persist.

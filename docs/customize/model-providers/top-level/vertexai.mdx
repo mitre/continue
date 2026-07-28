@@ -9,7 +9,15 @@ sidebarTitle: "Vertex AI"
   and set up [Google Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc)
 </Info>
 
+Vertex AI has two authentication modes, and they are mutually exclusive:
+
+- **Standard** — Google Cloud credentials, with `projectId` and `region`
+- **[Express](#how-to-enable-vertex-ai-express-mode)** — an API key alone
+
 ## Configuration
+
+Standard mode requires **both** `projectId` and `region`. Setting only one is a
+configuration error.
 
 <Tabs>
     <Tab title="YAML">
@@ -44,9 +52,31 @@ sidebarTitle: "Vertex AI"
     </Tab>
 </Tabs>
 
+### Service account credentials
+
+By default the provider uses [Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc).
+To point at a specific service account instead, set **either** `keyFile` (a path
+to the JSON key) **or** `keyJson` (the key contents inline) — not both.
+
+```yaml title="config.yaml"
+models:
+  - name: <MODEL_NAME>
+    provider: vertexai
+    model: <MODEL_ID>
+    env:
+      projectId: <PROJECT_ID>
+      region: us-east5
+      keyFile: /path/to/service-account.json
+```
+
 ## How to Enable Vertex AI Express Mode
 
 You can use Vertex AI in [express mode](https://cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview) by only providing an API Key. Only some Gemini models are supported in express mode for now.
+
+<Warning>
+  Express mode accepts `apiKey` **only**. Combining it with `region`,
+  `projectId`, `keyFile`, or `keyJson` is rejected — pick one mode or the other.
+</Warning>
 
 <Tabs>
     <Tab title="YAML">
@@ -77,3 +107,32 @@ You can use Vertex AI in [express mode](https://cloud.google.com/vertex-ai/gener
     ```
     </Tab>
 </Tabs>
+
+## Available models
+
+Vertex AI serves models from three publishers, and the provider routes requests
+based on the model ID:
+
+| Publisher | Example model IDs | Reference |
+|-----------|-------------------|-----------|
+| Google | `gemini-2.5-pro`, `gemini-2.5-flash` | [Gemini on Vertex AI](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models) |
+| Anthropic | Claude models | [Claude on Vertex AI](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude) |
+| Mistral | Codestral and other Mistral models | [Mistral on Vertex AI](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/mistral) |
+
+Gemini model IDs are the same on Vertex AI as on the
+[Gemini API](/customize/model-providers/top-level/gemini) — `gemini-2.5-pro` is
+`gemini-2.5-pro` in both places. A model ID that matches none of the three
+publishers is rejected as unsupported.
+
+## Supported roles
+
+| Role | Supported | Notes |
+|------|-----------|-------|
+| `chat` | Yes | |
+| `edit` | Yes | |
+| `apply` | Yes | |
+| `summarize` | Yes | |
+| `subagent` | Yes | |
+| `embed` | Yes | |
+| `autocomplete` | Codestral only | Fill-in-the-middle is rejected for any non-Codestral model |
+| `rerank` | **No** | Not supported by this provider |
