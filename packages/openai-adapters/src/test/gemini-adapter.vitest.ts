@@ -3,25 +3,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GeminiApi as GeminiApiType } from "../apis/Gemini.js";
 
 const generateContentStream = vi.fn();
+const embedContent = vi.fn();
 const GoogleGenAIMock = vi.fn().mockImplementation(() => ({
   models: {
     generateContentStream,
+    embedContent,
   },
 }));
 
 vi.mock("@google/genai", () => ({
   GoogleGenAI: GoogleGenAIMock,
 }));
-
-const fetchwithRequestOptionsMock = vi.fn();
-vi.mock("@continuedev/fetch", async () => {
-  const actual = await vi.importActual("@continuedev/fetch");
-  return {
-    ...actual,
-    fetchwithRequestOptions: (...args: unknown[]) =>
-      fetchwithRequestOptionsMock(...args),
-  };
-});
 
 describe("GeminiApi GoogleGenAI construction", () => {
   afterEach(() => {
@@ -373,57 +365,83 @@ describe("extractNestedGeminiError (direct vectors)", () => {
   });
 });
 
-describe("GeminiApi embed", () => {
+describe("GeminiApi embed (SDK-native)", () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  it("POSTs batchEmbedContents against apiBase with x-goog-api-key header", async () => {
-    fetchwithRequestOptionsMock.mockResolvedValue({
-      json: async () => ({
-        total_tokens: 7,
-        prompt_tokens: 7,
-        batchEmbedContents: [{ values: [0.1, 0.2] }],
-      }),
+  it("calls SDK embedContent and maps embeddings to OpenAI format", async () => {
+    // Google's REAL response shape, live-verified 2026-07-28:
+    // { embeddings: [{ values: [...] }] } — no batchEmbedContents, no usage.
+    embedContent.mockResolvedValue({
+      embeddings: [{ values: [0.1, 0.2] }, { values: [0.3, 0.4] }],
     });
 
     const { GeminiApi } = await import("../apis/Gemini.js");
     const api = new GeminiApi({
       provider: "gemini",
       apiKey: "primary-api-key",
-      apiBase: "https://gateway.example.com/v1beta/",
     });
 
     const result = await api.embed({
       model: "gemini-embedding-001",
-      input: ["hello"],
+      input: ["hello", "world"],
     });
 
-    const [url, init] = fetchwithRequestOptionsMock.mock.calls[0];
-    expect(url.toString()).toBe(
-      "https://gateway.example.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
-    );
-    expect(init.headers["x-goog-api-key"]).toBe("primary-api-key");
-    expect(JSON.parse(init.body)).toEqual({
-      requests: [
-        {
-          model: "models/gemini-embedding-001",
-          content: { role: "user", parts: [{ text: "hello" }] },
-        },
-      ],
+    expect(embedContent).toHaveBeenCalledWith({
+      model: "gemini-embedding-001",
+      contents: ["hello", "world"],
     });
-    expect(result.data[0].embedding).toEqual([0.1, 0.2]);
-    expect(result.usage).toEqual({ total_tokens: 7, prompt_tokens: 7 });
+    expect(result.data).toEqual([
+      { index: 0, embedding: [0.1, 0.2], object: "embedding" },
+      { index: 1, embedding: [0.3, 0.4], object: "embedding" },
+    ]);
+    // Google reports no token counts for embeddings — shared helper default
+    expect(result.usage).toEqual({ prompt_tokens: 0, total_tokens: 0 });
   });
 
-  it("does not double-prefix a models/-qualified model name", async () => {
-    fetchwithRequestOptionsMock.mockResolvedValue({
-      json: async () => ({
-        total_tokens: 1,
-        prompt_tokens: 1,
-        batchEmbedContents: [{ values: [0.5] }],
-      }),
+  it("wraps a single string input into a one-element contents array", async () => {
+    embedContent.mockResolvedValue({ embeddings: [{ values: [0.5] }] });
+    const { GeminiApi } = await import("../apis/Gemini.js");
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "primary-api-key",
     });
+
+    await api.embed({ model: "gemini-embedding-001", input: "hi" });
+
+    expect(embedContent).toHaveBeenCalledWith({
+      model: "gemini-embedding-001",
+      contents: ["hi"],
+    });
+  });
+
+  it("normalizes SDK errors through the shared nested-message extraction", async () => {
+    const googleBody = JSON.stringify(
+      {
+        error: {
+          code: 429,
+          message: "You exceeded your current quota.",
+          status: "RESOURCE_EXHAUSTED",
+        },
+      },
+      null,
+      2,
+    );
+    class FakeApiError extends Error {
+      status = 429;
+    }
+    embedContent.mockRejectedValue(
+      new FakeApiError(
+        JSON.stringify({
+          error: {
+            message: `${googleBody}\n`,
+            code: 429,
+            status: "Too Many Requests",
+          },
+        }),
+      ),
+    );
 
     const { GeminiApi } = await import("../apis/Gemini.js");
     const api = new GeminiApi({
@@ -431,14 +449,29 @@ describe("GeminiApi embed", () => {
       apiKey: "primary-api-key",
     });
 
-    await api.embed({
-      model: "models/gemini-embedding-001",
-      input: "hi",
+    let thrown: (Error & { status?: number }) | undefined;
+    try {
+      await api.embed({ model: "gemini-embedding-001", input: "hi" });
+    } catch (error) {
+      thrown = error as Error & { status?: number };
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown!.message).toContain("You exceeded your current quota");
+    expect(thrown!.message.startsWith('{"error"')).toBe(false);
+    expect(thrown!.status).toBe(429);
+  });
+
+  it("throws when the SDK returns no embeddings", async () => {
+    embedContent.mockResolvedValue({ embeddings: undefined });
+    const { GeminiApi } = await import("../apis/Gemini.js");
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "primary-api-key",
     });
 
-    const [url] = fetchwithRequestOptionsMock.mock.calls[0];
-    expect(url.toString()).toBe(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
-    );
+    await expect(
+      api.embed({ model: "gemini-embedding-001", input: "hi" }),
+    ).rejects.toThrow(/no embeddings/i);
   });
 });

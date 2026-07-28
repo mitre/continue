@@ -24,7 +24,6 @@ import { GeminiConfig } from "../types.js";
 import {
   chatChunk,
   chatChunkFromDelta,
-  customFetch,
   embedding,
   usageChatChunk,
 } from "../util.js";
@@ -597,44 +596,42 @@ export class GeminiApi implements BaseLlmApi {
 
   async embed(body: EmbeddingCreateParams): Promise<CreateEmbeddingResponse> {
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
-    // The Gemini REST resource is `models/{model}` — normalize bare model
-    // names to that form. Without the `models/` path segment, a bare name
-    // like `gemini-embedding-001:batchEmbedContents` parses as an absolute
-    // URL whose scheme is the model name, silently discarding apiBase.
-    const model = body.model.startsWith("models/")
-      ? body.model
-      : `models/${body.model}`;
-    const response = await customFetch(this.config.requestOptions)(
-      new URL(`${model}:batchEmbedContents`, this.apiBase),
-      {
-        method: "POST",
-        body: JSON.stringify({
-          requests: inputs.map((input) => ({
-            model,
-            content: {
-              role: "user",
-              parts: [{ text: input }],
-            },
-          })),
-        }),
-        headers: {
-          // eslint-disable-next-line @typescript-eslint/naming-convention
-          "x-goog-api-key": this.config.apiKey,
-          // eslint-disable-next-line @typescript-eslint/naming-convention
-          "Content-Type": "application/json",
-        },
-      },
-    );
+    try {
+      // The SDK owns the REST contract — URL construction, model-name
+      // normalization, and the response shape ({ embeddings: [{ values }] }).
+      // Same proxy/TLS wrapper and error normalization as the chat paths.
+      const response = await withRequestOptionsFetch(
+        this.config.requestOptions,
+        () =>
+          this.genAI.models.embedContent({
+            model: body.model,
+            contents: inputs.map((input) => String(input)),
+          }),
+      );
 
-    const data = (await response.json()) as any;
-    return embedding({
-      model: body.model,
-      usage: {
-        total_tokens: data.total_tokens,
-        prompt_tokens: data.prompt_tokens,
-      },
-      data: data.batchEmbedContents.map((embedding: any) => embedding.values),
-    });
+      const embeddings = response.embeddings;
+      if (!embeddings || embeddings.length === 0) {
+        throw new Error(
+          `Gemini returned no embeddings for model ${body.model}`,
+        );
+      }
+
+      return embedding({
+        model: body.model,
+        // Google's embeddings API reports no token counts — the shared
+        // helper applies its documented zero-usage default.
+        data: embeddings.map((entry, index) => {
+          if (!entry.values) {
+            throw new Error(
+              `Gemini returned no values for embedding at index ${index}`,
+            );
+          }
+          return entry.values;
+        }),
+      });
+    } catch (error) {
+      throw normalizeGeminiError(error);
+    }
   }
 
   list(): Promise<Model[]> {
