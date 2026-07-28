@@ -19,6 +19,9 @@ function asJsonObject(value: unknown): JsonObject | undefined {
  * with shared test vectors rather than a new cross-package export).
  */
 export function extractNestedJsonMessage(raw: string): string | undefined {
+  // Bound the unwrap depth so a gateway returning deeply nested error
+  // envelopes cannot force unbounded sequential parses.
+  const MAX_DEPTH = 8;
   let node: unknown;
   try {
     node = JSON.parse(raw);
@@ -27,7 +30,7 @@ export function extractNestedJsonMessage(raw: string): string | undefined {
   }
 
   let message: string | undefined;
-  while (true) {
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
     const obj = asJsonObject(node);
     if (!obj) {
       break;

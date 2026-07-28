@@ -12,6 +12,7 @@ import {
 } from "vitest";
 
 import { GeminiApi } from "../apis/Gemini.js";
+import { sseChunk } from "./gemini-test-helpers.js";
 
 /**
  * End-to-end proof for the proxy path: the REAL @google/genai SDK, the REAL
@@ -33,17 +34,6 @@ const geminiRequests: {
 }[] = [];
 /** Number of requests that transited the proxy. */
 let proxiedRequests = 0;
-
-function sseChunk(text: string, finishReason?: string): string {
-  const candidate: Record<string, unknown> = {
-    content: { role: "model", parts: [{ text }] },
-    index: 0,
-  };
-  if (finishReason) {
-    candidate.finishReason = finishReason;
-  }
-  return `data: ${JSON.stringify({ candidates: [candidate] })}\r\n\r\n`;
-}
 
 beforeAll(async () => {
   geminiServer = http.createServer((req, res) => {
@@ -125,6 +115,8 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
   });
 
   it("streams SSE chunks via the real SDK, customFetch, and proxy", async () => {
+    const proxiedBefore = proxiedRequests;
+    const requestsBefore = geminiRequests.length;
     const api = new GeminiApi({
       provider: "gemini",
       apiKey: "stub-key",
@@ -147,10 +139,10 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
     }
 
     expect(content).toBe("Hello from the proxied stub");
-    expect(proxiedRequests).toBe(1);
-    expect(geminiRequests).toHaveLength(1);
-    expect(geminiRequests[0].apiKey).toBe("stub-key");
-    expect(geminiRequests[0].url).toContain(":streamGenerateContent");
+    expect(proxiedRequests).toBe(proxiedBefore + 1);
+    const observed = geminiRequests[requestsBefore];
+    expect(observed.apiKey).toBe("stub-key");
+    expect(observed.url).toContain(":streamGenerateContent");
   });
 
   it("delivers custom requestOptions.headers to the wire", async () => {
@@ -208,6 +200,37 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
 
     expect(content).toBe("Hello from the proxied stub");
     expect(proxiedRequests).toBe(proxiedBefore + 1);
+  });
+
+  it("delivers custom headers alongside an environment proxy", async () => {
+    vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${proxyPort}`);
+    const proxiedBefore = proxiedRequests;
+    const requestsBefore = geminiRequests.length;
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+      requestOptions: {
+        headers: { "x-custom-gateway": "gw-credential-456" },
+      },
+    });
+
+    for await (const _chunk of api.chatCompletionStream(
+      {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )) {
+      // drain
+    }
+
+    // Env proxy engages the wrapper AND custom headers still reach the wire.
+    expect(proxiedRequests).toBe(proxiedBefore + 1);
+    expect(geminiRequests[requestsBefore].customHeader).toBe(
+      "gw-credential-456",
+    );
   });
 
   it("goes direct when NO_PROXY covers the target host", async () => {

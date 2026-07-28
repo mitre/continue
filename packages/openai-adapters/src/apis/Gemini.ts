@@ -115,10 +115,18 @@ function asJsonObject(value: unknown): JsonObject | undefined {
  * Walks the nesting until the innermost message; returns undefined for
  * non-JSON, malformed, or message-less input so callers can pass the
  * original error through unchanged.
+ *
+ * Mirrored by extractNestedJsonMessage in
+ * extensions/cli/src/util/formatError.ts — kept as a small local mirror
+ * with shared test vectors rather than a new cross-package export. Keep the
+ * two in sync.
  */
 export function extractNestedGeminiError(
   raw: string,
 ): { message: string; code?: number } | undefined {
+  // Bound the unwrap depth so a gateway returning deeply nested error
+  // envelopes cannot force unbounded sequential parses.
+  const MAX_DEPTH = 8;
   let node: unknown;
   try {
     node = JSON.parse(raw);
@@ -129,7 +137,7 @@ export function extractNestedGeminiError(
   let message: string | undefined;
   let code: number | undefined;
 
-  while (true) {
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
     const obj = asJsonObject(node);
     if (!obj) {
       break;

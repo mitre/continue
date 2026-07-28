@@ -5,9 +5,19 @@ import { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { TLSSocket } from "node:tls";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import { GeminiApi } from "../apis/Gemini.js";
+import { sseChunk } from "./gemini-test-helpers.js";
 
 /**
  * TLS and mutual-TLS behavior through the REAL @google/genai SDK and the REAL
@@ -32,17 +42,6 @@ const mtlsObserved: { authorized: boolean; cn: string | undefined }[] = [];
 
 const CLIENT_CN = "continue-mtls-client";
 const CLIENT_KEY_PASSPHRASE = "test-passphrase";
-
-function sseChunk(text: string, finishReason?: string): string {
-  const candidate: Record<string, unknown> = {
-    content: { role: "model", parts: [{ text }] },
-    index: 0,
-  };
-  if (finishReason) {
-    candidate.finishReason = finishReason;
-  }
-  return `data: ${JSON.stringify({ candidates: [candidate] })}\r\n\r\n`;
-}
 
 /**
  * Mini-CA: CA keypair, a CA-signed server certificate for 127.0.0.1, and a
@@ -162,7 +161,9 @@ beforeAll(async () => {
     mtlsServer.listen(0, "127.0.0.1", resolve),
   );
   mtlsPort = (mtlsServer.address() as AddressInfo).port;
-});
+  // Seven sequential openssl invocations — generous timeout for contended
+  // CI workers (runs in ~1s locally).
+}, 30_000);
 
 afterAll(async () => {
   await new Promise((resolve) => tlsServer.close(resolve));
@@ -198,6 +199,21 @@ async function drainChat(api: GeminiApi): Promise<string> {
 }
 
 describe("Gemini TLS through the real SDK (no mocks)", () => {
+  beforeEach(() => {
+    // Deterministic under ambient corporate proxy environments — without
+    // this, a machine with HTTPS_PROXY set routes these stub-server calls
+    // into the proxy and the whole suite fails for non-TLS reasons.
+    vi.stubEnv("HTTP_PROXY", "");
+    vi.stubEnv("http_proxy", "");
+    vi.stubEnv("HTTPS_PROXY", "");
+    vi.stubEnv("https_proxy", "");
+    vi.stubEnv("NO_PROXY", "");
+    vi.stubEnv("no_proxy", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
   it("rejects a server signed by an unknown CA when verifySsl is on", async () => {
     await expect(
       drainChat(makeApi(tlsPort, { verifySsl: true })),
@@ -220,6 +236,18 @@ describe("Gemini TLS through the real SDK (no mocks)", () => {
 });
 
 describe("Gemini mutual TLS through the real SDK (no mocks)", () => {
+  beforeEach(() => {
+    vi.stubEnv("HTTP_PROXY", "");
+    vi.stubEnv("http_proxy", "");
+    vi.stubEnv("HTTPS_PROXY", "");
+    vi.stubEnv("https_proxy", "");
+    vi.stubEnv("NO_PROXY", "");
+    vi.stubEnv("no_proxy", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
   it("rejects the handshake when the server requires a client certificate and none is configured", async () => {
     await expect(
       drainChat(makeApi(mtlsPort, { caBundlePath: caCertPath })),
