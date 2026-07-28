@@ -22,9 +22,9 @@ through Google Cloud instead, see [Vertex AI](/customize/model-providers/top-lev
   schema: v1
 
   models:
-    - name: Gemini 2.5 Pro
+    - name: Gemini Flash
       provider: gemini
-      model: gemini-2.5-pro
+      model: gemini-flash-latest
       apiKey: ${{ secrets.GEMINI_API_KEY }}
       roles:
         - chat
@@ -37,9 +37,9 @@ through Google Cloud instead, see [Vertex AI](/customize/model-providers/top-lev
   {
     "models": [
       {
-        "title": "Gemini 2.5 Pro",
+        "title": "Gemini Flash",
         "provider": "gemini",
-        "model": "gemini-2.5-pro",
+        "model": "gemini-flash-latest",
         "apiKey": "<YOUR_GEMINI_API_KEY>"
       }
     ]
@@ -88,15 +88,22 @@ authoritative list; the IDs below are a starting point.
 
 | Model ID | Notes |
 |----------|-------|
-| `gemini-2.5-pro` | Strongest reasoning of the 2.5 line |
-| `gemini-2.5-flash` | Balanced price and performance |
-| `gemini-2.5-flash-lite` | Lowest cost of the 2.5 line |
-| `gemini-3.5-flash` | Strong on agentic and coding tasks |
-| `gemini-3.6-flash` | Speed with multimodal and agentic support |
-| `gemini-3.5-flash-lite` | Fastest, most cost-effective |
+| `gemini-flash-latest` | Alias tracking the current Flash model — a safe default |
+| `gemini-pro-latest` | Alias tracking the current Pro (reasoning) model |
+| `gemini-flash-lite-latest` | Alias tracking the current lowest-cost model |
+| `gemini-3.1-pro-preview` | Latest Pro preview |
+| `gemini-3-flash-preview` | Flash preview |
+| `gemini-3.1-flash-lite` | Cost-optimized 3.1 |
 
-Preview models such as `gemini-3.1-pro-preview` are also available. Preview IDs
-change and are eventually retired, so prefer a stable ID for anything long-lived.
+<Warning>
+  Google gates some older model IDs away from **new** API keys: `gemini-2.5-*`
+  IDs still appear in the API's model list but return "no longer available to
+  new users" when invoked with a recently created key. Existing keys keep
+  access. The `-latest` aliases avoid this class of surprise entirely.
+</Warning>
+
+Preview IDs change and are eventually retired, so prefer an alias or stable ID
+for anything long-lived.
 
 ### Embeddings
 
@@ -109,7 +116,7 @@ change and are eventually retired, so prefer a stable ID for anything long-lived
 models:
   - name: Gemini Embeddings
     provider: gemini
-    model: gemini-embedding-2
+    model: gemini-embedding-001
     apiKey: ${{ secrets.GEMINI_API_KEY }}
     roles:
       - embed
@@ -146,7 +153,7 @@ streaming, and embeddings:
 models:
   - name: Gemini via Gateway
     provider: gemini
-    model: gemini-2.5-pro
+    model: gemini-flash-latest
     apiBase: https://gateway.example.com/v1beta/
     apiKey: ${{ secrets.GATEWAY_API_KEY }}
     requestOptions:

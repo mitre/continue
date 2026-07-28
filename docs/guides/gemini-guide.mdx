@@ -42,9 +42,9 @@ you specifically need Google Cloud.
     schema: v1
 
     models:
-      - name: Gemini 2.5 Pro
+      - name: Gemini Flash
         provider: gemini
-        model: gemini-2.5-pro
+        model: gemini-flash-latest
         apiKey: ${{ secrets.GEMINI_API_KEY }}
         roles:
           - chat
@@ -72,14 +72,22 @@ source of truth.
 
 | Model ID | Good for |
 |----------|----------|
-| `gemini-2.5-pro` | Complex reasoning, hard refactors, architecture questions |
-| `gemini-2.5-flash` | Everyday chat and edits; solid price-performance |
-| `gemini-2.5-flash-lite` | High-volume, cost-sensitive work |
-| `gemini-3.5-flash` | Agentic and coding tasks |
-| `gemini-3.6-flash` | Agentic and multimodal work needing speed |
+| `gemini-flash-latest` | Everyday chat and edits — alias tracking the current Flash model |
+| `gemini-pro-latest` | Complex reasoning, hard refactors — alias tracking the current Pro model |
+| `gemini-flash-lite-latest` | High-volume, cost-sensitive work |
+| `gemini-3.1-pro-preview` | Latest Pro preview capabilities |
+| `gemini-3.1-flash-lite` | Cost-optimized 3.1 |
 
-Preview IDs such as `gemini-3.1-pro-preview` expose newer capabilities but get
-retired on Google's schedule. Prefer a stable ID for anything you rely on.
+<Warning>
+  Google gates some older IDs away from **new** API keys: `gemini-2.5-*`
+  models still appear in the API's model list but return "no longer available
+  to new users" when invoked with a recently created key. If you just made
+  your key and a tutorial's model ID fails with that message, switch to a
+  `-latest` alias or a 3.x ID.
+</Warning>
+
+Preview IDs get retired on Google's schedule. Prefer the `-latest` aliases for
+anything you rely on.
 
 <Tip>
   Configure more than one model and switch as needed — a Pro model for design
@@ -109,7 +117,7 @@ For embeddings, add a second entry:
 models:
   - name: Gemini Embeddings
     provider: gemini
-    model: gemini-embedding-2
+    model: gemini-embedding-001
     apiKey: ${{ secrets.GEMINI_API_KEY }}
     roles:
       - embed
@@ -194,9 +202,9 @@ chat, streaming, and embeddings alike:
 
 ```yaml title="~/.continue/config.yaml"
 models:
-  - name: Gemini 2.5 Pro
+  - name: Gemini Flash
     provider: gemini
-    model: gemini-2.5-pro
+    model: gemini-flash-latest
     apiKey: ${{ secrets.GEMINI_API_KEY }}
     requestOptions:
       proxy: http://proxy.internal:8080
@@ -227,7 +235,7 @@ cn --config ~/.continue/config.yaml -p "Summarize the changes on this branch"
 
 <Note>
   `--model` expects a model slug, not a provider model ID —
-  `cn --model gemini-2.5-pro` will not work. Define models in `config.yaml`.
+  `cn --model gemini-flash-latest` will not work. Define models in `config.yaml`.
 </Note>
 
 Your model must have the `chat` role; that is what the agent runs on.
@@ -250,7 +258,7 @@ Your model must have the `chat` role; that is what the agent runs on.
     Free-tier quotas are per-model and per-minute; the error message states the
     exact quota hit and a retry delay. Check your usage and limits on
     [Google's rate-limit page](https://ai.google.dev/gemini-api/docs/rate-limits),
-    or switch the model entry to a lower-cost ID (e.g. `gemini-2.5-flash-lite`)
+    or switch the model entry to a lower-cost ID (e.g. `gemini-flash-lite-latest`)
     while iterating.
   </Accordion>
 
@@ -264,6 +272,11 @@ Your model must have the `chat` role; that is what the agent runs on.
   <Accordion title="Model not found, or the model ID is rejected">
     Google retires models, and preview IDs change. Confirm the ID against
     [Google's model list](https://ai.google.dev/gemini-api/docs/models).
+
+    If the error says the model is "no longer available to new users", your API
+    key is newer than the model's availability window — `gemini-2.5-*` IDs are
+    gated this way even though the API still lists them. Switch to a `-latest`
+    alias (`gemini-flash-latest`, `gemini-pro-latest`) or a 3.x ID.
 
     On Vertex AI, a model ID that matches none of Vertex's publishers (Google,
     Anthropic, Mistral) is rejected as unsupported.
