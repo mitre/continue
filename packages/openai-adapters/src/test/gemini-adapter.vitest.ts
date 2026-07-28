@@ -474,4 +474,19 @@ describe("GeminiApi embed (SDK-native)", () => {
       api.embed({ model: "gemini-embedding-001", input: "hi" }),
     ).rejects.toThrow(/no embeddings/i);
   });
+
+  it("throws naming the index when an embedding entry has no values", async () => {
+    embedContent.mockResolvedValue({
+      embeddings: [{ values: [0.1] }, {}],
+    });
+    const { GeminiApi } = await import("../apis/Gemini.js");
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "primary-api-key",
+    });
+
+    await expect(
+      api.embed({ model: "gemini-embedding-001", input: ["a", "b"] }),
+    ).rejects.toThrow(/no values for embedding at index 1/i);
+  });
 });
