@@ -87,6 +87,7 @@ describe("adaptToNativeResponse", () => {
 
 describe("withRequestOptionsFetch", () => {
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.clearAllMocks();
   });
 
@@ -121,7 +122,15 @@ describe("withRequestOptionsFetch", () => {
     expect(globalThis.fetch).toBe(before);
   });
 
+  function clearProxyEnv(): void {
+    vi.stubEnv("HTTPS_PROXY", "");
+    vi.stubEnv("https_proxy", "");
+    vi.stubEnv("HTTP_PROXY", "");
+    vi.stubEnv("http_proxy", "");
+  }
+
   it("uses the native-fetch fast path when no proxy/TLS options are set", async () => {
+    clearProxyEnv();
     const { withRequestOptionsFetch } = await import(
       "../util/requestOptionsFetch.js"
     );
@@ -140,6 +149,40 @@ describe("withRequestOptionsFetch", () => {
 
     expect(seen).toEqual([nativeFetch, nativeFetch]);
     expect(fetchwithRequestOptionsMock).not.toHaveBeenCalled();
+  });
+
+  it("engages the wrapper when only an environment proxy is set", async () => {
+    clearProxyEnv();
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.corp.example:8080");
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    let observedFetch: typeof globalThis.fetch | undefined;
+    await withRequestOptionsFetch(undefined, async () => {
+      observedFetch = globalThis.fetch;
+    });
+
+    // Corporate env-var proxies (the reason a user's Python sample works
+    // while Continue fails) must route through customFetch like every
+    // other provider — not the native fast path.
+    expect(observedFetch).toBeDefined();
+    expect(observedFetch).not.toBe(nativeFetch);
+  });
+
+  it("engages the wrapper for lowercase http_proxy too", async () => {
+    clearProxyEnv();
+    vi.stubEnv("http_proxy", "http://proxy.corp.example:8080");
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    let observedFetch: typeof globalThis.fetch | undefined;
+    await withRequestOptionsFetch(undefined, async () => {
+      observedFetch = globalThis.fetch;
+    });
+
+    expect(observedFetch).not.toBe(nativeFetch);
   });
 
   it("restores all four swapped globals even when the callback throws", async () => {

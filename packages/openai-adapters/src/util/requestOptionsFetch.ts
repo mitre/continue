@@ -1,4 +1,5 @@
 import { RequestOptions } from "@continuedev/config-types";
+import { getProxyFromEnv } from "@continuedev/fetch";
 import { Readable } from "node:stream";
 
 import { customFetch } from "../util.js";
@@ -28,6 +29,18 @@ export function hasProxyOrTlsOptions(
       requestOptions.caBundlePath !== undefined ||
       requestOptions.clientCertificate !== undefined)
   );
+}
+
+/**
+ * True when an ambient HTTPS_PROXY/HTTP_PROXY environment proxy exists.
+ * Env-var proxies are the standard corporate setup and are honored by every
+ * customFetch-based provider; the Gemini SDK path must match. Resolution
+ * precedence (config over env) and NO_PROXY bypass stay entirely with
+ * customFetch/getProxy at request time — this predicate only decides whether
+ * to engage the wrapper.
+ */
+function hasEnvironmentProxy(): boolean {
+  return !!(getProxyFromEnv("https:") || getProxyFromEnv("http:"));
 }
 
 /**
@@ -76,7 +89,7 @@ export async function withRequestOptionsFetch<T>(
   requestOptions: RequestOptions | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  if (!hasProxyOrTlsOptions(requestOptions)) {
+  if (!hasProxyOrTlsOptions(requestOptions) && !hasEnvironmentProxy()) {
     return withNativeFetch(fn);
   }
 

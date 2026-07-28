@@ -1,6 +1,15 @@
 import http from "node:http";
 import { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import { GeminiApi } from "../apis/Gemini.js";
 
@@ -59,10 +68,23 @@ beforeAll(async () => {
   );
   geminiPort = (geminiServer.address() as AddressInfo).port;
 
-  // Minimal HTTP forward proxy: receives absolute-URI requests, forwards
-  // them, pipes the response back.
-  proxyServer = http.createServer((req, res) => {
+  proxyServer = makeForwardProxy(() => {
     proxiedRequests += 1;
+  });
+  await new Promise<void>((resolve) =>
+    proxyServer.listen(0, "127.0.0.1", resolve),
+  );
+  proxyPort = (proxyServer.address() as AddressInfo).port;
+});
+
+/**
+ * Minimal HTTP forward proxy: receives absolute-URI requests, forwards them,
+ * pipes the response back. onRequest fires for every transit — the
+ * discriminating signal for which proxy (if any) a request dialed.
+ */
+function makeForwardProxy(onRequest: () => void): http.Server {
+  return http.createServer((req, res) => {
+    onRequest();
     const target = new URL(req.url ?? "");
     const upstream = http.request(
       {
@@ -79,11 +101,7 @@ beforeAll(async () => {
     );
     req.pipe(upstream);
   });
-  await new Promise<void>((resolve) =>
-    proxyServer.listen(0, "127.0.0.1", resolve),
-  );
-  proxyPort = (proxyServer.address() as AddressInfo).port;
-});
+}
 
 afterAll(async () => {
   await new Promise((resolve) => geminiServer.close(resolve));
@@ -91,6 +109,21 @@ afterAll(async () => {
 });
 
 describe("Gemini streaming through a real local proxy (no mocks)", () => {
+  beforeEach(() => {
+    // Deterministic regardless of the machine's ambient proxy environment;
+    // individual tests re-stub what they need.
+    vi.stubEnv("HTTP_PROXY", "");
+    vi.stubEnv("http_proxy", "");
+    vi.stubEnv("HTTPS_PROXY", "");
+    vi.stubEnv("https_proxy", "");
+    vi.stubEnv("NO_PROXY", "");
+    vi.stubEnv("no_proxy", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("streams SSE chunks via the real SDK, customFetch, and proxy", async () => {
     const api = new GeminiApi({
       provider: "gemini",
@@ -145,6 +178,111 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
 
     const observed = geminiRequests[before];
     expect(observed.customHeader).toBe("gw-credential-123");
+  });
+
+  it("uses an environment proxy when no config proxy is set", async () => {
+    // The corporate case: proxy exists only as env vars (why a user's plain
+    // Python sample works). No requestOptions at all.
+    vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${proxyPort}`);
+    vi.stubEnv("NO_PROXY", "");
+    vi.stubEnv("no_proxy", "");
+
+    const proxiedBefore = proxiedRequests;
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+    });
+
+    let content = "";
+    for await (const chunk of api.chatCompletionStream(
+      {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )) {
+      content += chunk.choices[0]?.delta?.content ?? "";
+    }
+
+    expect(content).toBe("Hello from the proxied stub");
+    expect(proxiedRequests).toBe(proxiedBefore + 1);
+  });
+
+  it("goes direct when NO_PROXY covers the target host", async () => {
+    vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${proxyPort}`);
+    vi.stubEnv("NO_PROXY", "127.0.0.1");
+
+    const proxiedBefore = proxiedRequests;
+    const requestsBefore = geminiRequests.length;
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+    });
+
+    let content = "";
+    for await (const chunk of api.chatCompletionStream(
+      {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )) {
+      content += chunk.choices[0]?.delta?.content ?? "";
+    }
+
+    expect(content).toBe("Hello from the proxied stub");
+    expect(proxiedRequests).toBe(proxiedBefore); // proxy NOT used
+    expect(geminiRequests.length).toBe(requestsBefore + 1); // server reached directly
+  });
+
+  it("prefers the config proxy over an environment proxy", async () => {
+    // Two REAL proxies: env points at one, config at the other. The
+    // hit-counters discriminate which was actually dialed — directly
+    // exercising getProxy()'s config-first precedence at the wire.
+    let envProxyHits = 0;
+    const envProxy = makeForwardProxy(() => {
+      envProxyHits += 1;
+    });
+    await new Promise<void>((resolve) =>
+      envProxy.listen(0, "127.0.0.1", resolve),
+    );
+    const envProxyPort = (envProxy.address() as AddressInfo).port;
+
+    try {
+      vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${envProxyPort}`);
+
+      const configProxiedBefore = proxiedRequests;
+      const api = new GeminiApi({
+        provider: "gemini",
+        apiKey: "stub-key",
+        apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+        requestOptions: {
+          proxy: `http://127.0.0.1:${proxyPort}`,
+        },
+      });
+
+      let content = "";
+      for await (const chunk of api.chatCompletionStream(
+        {
+          model: "gemini-2.5-flash",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        },
+        new AbortController().signal,
+      )) {
+        content += chunk.choices[0]?.delta?.content ?? "";
+      }
+
+      expect(content).toBe("Hello from the proxied stub");
+      expect(proxiedRequests).toBe(configProxiedBefore + 1); // config proxy dialed
+      expect(envProxyHits).toBe(0); // env proxy never touched
+    } finally {
+      await new Promise((resolve) => envProxy.close(resolve));
+    }
   });
 
   it("routes embed through the same proxy and parses Google's real shape", async () => {
