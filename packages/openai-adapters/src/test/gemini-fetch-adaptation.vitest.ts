@@ -1,0 +1,235 @@
+import { Readable } from "node:stream";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { nativeFetch } from "../util/nativeFetch.js";
+
+const fetchwithRequestOptionsMock = vi.fn();
+vi.mock("@continuedev/fetch", async () => {
+  const actual = await vi.importActual("@continuedev/fetch");
+  return {
+    ...actual,
+    fetchwithRequestOptions: (...args: unknown[]) =>
+      fetchwithRequestOptionsMock(...args),
+  };
+});
+
+/** Minimal stand-in for a node-fetch Response: Node Readable body, no getReader. */
+function nodeFetchStyleResponse(
+  chunks: string[],
+  init: { status?: number; statusText?: string; headers?: [string, string][] },
+) {
+  return {
+    status: init.status ?? 200,
+    statusText: init.statusText ?? "OK",
+    headers: new Map(init.headers ?? []),
+    body:
+      chunks.length > 0
+        ? Readable.from(chunks.map((chunk) => Buffer.from(chunk)))
+        : null,
+  };
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out += decoder.decode(value, { stream: true });
+  }
+  return out;
+}
+
+describe("adaptToNativeResponse", () => {
+  it("adapts a node-fetch-style Response so its body supports getReader()", async () => {
+    const { adaptToNativeResponse } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    const adapted = adaptToNativeResponse(
+      nodeFetchStyleResponse(
+        ['data: {"text":"hel', 'lo"}\n\n', "data: [DONE]\n\n"],
+        {
+          status: 200,
+          statusText: "OK",
+          headers: [["content-type", "text/event-stream"]],
+        },
+      ),
+    );
+
+    expect(adapted).toBeInstanceOf(Response);
+    expect(adapted.status).toBe(200);
+    expect(adapted.statusText).toBe("OK");
+    expect(adapted.headers.get("content-type")).toBe("text/event-stream");
+    expect(typeof adapted.body?.getReader).toBe("function");
+    await expect(readAll(adapted.body!)).resolves.toBe(
+      'data: {"text":"hello"}\n\ndata: [DONE]\n\n',
+    );
+  });
+
+  it("produces a null body for null-body statuses", async () => {
+    const { adaptToNativeResponse } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    const adapted = adaptToNativeResponse(
+      nodeFetchStyleResponse([], {
+        status: 204,
+        statusText: "No Content",
+      }),
+    );
+
+    expect(adapted.status).toBe(204);
+    expect(adapted.body).toBeNull();
+  });
+});
+
+describe("withRequestOptionsFetch", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("routes fetch through customFetch when proxy is configured, then restores", async () => {
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    fetchwithRequestOptionsMock.mockResolvedValue(
+      nodeFetchStyleResponse(["ok"], { status: 200, statusText: "OK" }),
+    );
+
+    const before = globalThis.fetch;
+    const requestOptions = { proxy: "http://proxy.example.com:8080" };
+
+    const result = await withRequestOptionsFetch(requestOptions, async () => {
+      const response = await globalThis.fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+      );
+      return response;
+    });
+
+    expect(fetchwithRequestOptionsMock).toHaveBeenCalledTimes(1);
+    expect(fetchwithRequestOptionsMock.mock.calls[0][0].toString()).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models",
+    );
+    expect(fetchwithRequestOptionsMock.mock.calls[0][2]).toEqual(
+      requestOptions,
+    );
+    expect(result).toBeInstanceOf(Response);
+    expect(typeof result.body?.getReader).toBe("function");
+    expect(globalThis.fetch).toBe(before);
+  });
+
+  it("uses the native-fetch fast path when no proxy/TLS options are set", async () => {
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    // headers/timeout alone are handled via SDK httpOptions — not this wrapper
+    const seen: (typeof globalThis.fetch)[] = [];
+    await withRequestOptionsFetch(
+      { headers: { "x-api-key": "k" }, timeout: 5 },
+      async () => {
+        seen.push(globalThis.fetch);
+      },
+    );
+    await withRequestOptionsFetch(undefined, async () => {
+      seen.push(globalThis.fetch);
+    });
+
+    expect(seen).toEqual([nativeFetch, nativeFetch]);
+    expect(fetchwithRequestOptionsMock).not.toHaveBeenCalled();
+  });
+
+  it("restores all four swapped globals even when the callback throws", async () => {
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+
+    // Sentinels make every restore line falsifiable: the ambient globals
+    // already equal the native classes the wrapper installs, so asserting on
+    // the ambient values could never catch a deleted restore line. With
+    // sentinels installed first, the try block replaces them with natives and
+    // ONLY a working finally can bring each sentinel back.
+    const sentinelFetch: typeof globalThis.fetch = async () => new Response();
+    class SentinelResponse extends Response {}
+    class SentinelRequest extends Request {}
+    class SentinelHeaders extends Headers {}
+
+    const ambient = {
+      fetch: globalThis.fetch,
+      Response: globalThis.Response,
+      Request: globalThis.Request,
+      Headers: globalThis.Headers,
+    };
+    try {
+      globalThis.fetch = sentinelFetch;
+      globalThis.Response = SentinelResponse;
+      globalThis.Request = SentinelRequest;
+      globalThis.Headers = SentinelHeaders;
+
+      await expect(
+        withRequestOptionsFetch({ verifySsl: false }, async () => {
+          throw new Error("boom");
+        }),
+      ).rejects.toThrow("boom");
+
+      expect(globalThis.fetch).toBe(sentinelFetch);
+      expect(globalThis.Response).toBe(SentinelResponse);
+      expect(globalThis.Request).toBe(SentinelRequest);
+      expect(globalThis.Headers).toBe(SentinelHeaders);
+    } finally {
+      globalThis.fetch = ambient.fetch;
+      globalThis.Response = ambient.Response;
+      globalThis.Request = ambient.Request;
+      globalThis.Headers = ambient.Headers;
+    }
+  });
+});
+
+describe("GeminiApi SDK-call fetch routing", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+  });
+
+  it("runs generateContentStream under the adapted fetch when proxy is set", async () => {
+    vi.doMock("@google/genai", () => {
+      const generateContentStream = vi.fn().mockImplementation(async () => {
+        // Capture the fetch active DURING the SDK call
+        capturedFetch = globalThis.fetch;
+        return (async function* () {})();
+      });
+      return {
+        GoogleGenAI: vi.fn().mockImplementation(() => ({
+          models: { generateContentStream },
+        })),
+      };
+    });
+    let capturedFetch: typeof globalThis.fetch | undefined;
+
+    const { GeminiApi } = await import("../apis/Gemini.js");
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "k",
+      requestOptions: { proxy: "http://proxy.example.com:8080" },
+    });
+
+    const stream = api.chatCompletionStream(
+      {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    );
+    for await (const _chunk of stream) {
+      // drain
+    }
+
+    expect(capturedFetch).toBeDefined();
+    expect(capturedFetch).not.toBe(nativeFetch);
+    expect(globalThis.fetch).not.toBe(capturedFetch);
+  });
+});

@@ -1,6 +1,7 @@
 // IMPORTANT: Import nativeFetch FIRST to preserve native fetch before any pollution
 import { withNativeFetch } from "../util/nativeFetch.js";
-import { GoogleGenAI } from "@google/genai";
+import { withRequestOptionsFetch } from "../util/requestOptionsFetch.js";
+import { GoogleGenAI, type HttpOptions } from "@google/genai";
 import { OpenAI } from "openai/index";
 import {
   ChatCompletion,
@@ -65,6 +66,118 @@ interface GeminiToolDelta
   };
 }
 
+/**
+ * Build the httpOptions handed to the GoogleGenAI SDK from Continue's config.
+ *
+ * The SDK constructs request URLs by joining `baseUrl` and `apiVersion` with
+ * a slash, skipping `apiVersion` when it is an empty string. Continue's
+ * `apiBase` already carries its version segment (e.g. `/v1beta/`), so
+ * `apiVersion` is blanked to keep the SDK from appending a second one.
+ *
+ * Returns undefined when nothing is configured so default-config construction
+ * is unchanged.
+ */
+function buildGoogleGenAIHttpOptions(
+  config: GeminiConfig,
+): HttpOptions | undefined {
+  const httpOptions: HttpOptions = {};
+
+  if (config.apiBase) {
+    httpOptions.baseUrl = config.apiBase;
+    httpOptions.apiVersion = "";
+  }
+
+  if (config.requestOptions?.headers) {
+    httpOptions.headers = config.requestOptions.headers;
+  }
+
+  if (config.requestOptions?.timeout !== undefined) {
+    httpOptions.timeout = config.requestOptions.timeout;
+  }
+
+  return Object.keys(httpOptions).length > 0 ? httpOptions : undefined;
+}
+
+type JsonObject = Record<string, unknown>;
+
+function asJsonObject(value: unknown): JsonObject | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as JsonObject)
+    : undefined;
+}
+
+/**
+ * Extract the human-readable message nested inside a Gemini API error blob.
+ *
+ * The SDK's ApiError.message is a JSON envelope ({ error: { message, code,
+ * status } }) whose error.message is often ITSELF a JSON string from Google
+ * (see upstream issue #12945) — so users see "Unknown error" while the real
+ * cause ("You exceeded your current quota...") sits two parse levels deep.
+ * Walks the nesting until the innermost message; returns undefined for
+ * non-JSON, malformed, or message-less input so callers can pass the
+ * original error through unchanged.
+ */
+export function extractNestedGeminiError(
+  raw: string,
+): { message: string; code?: number } | undefined {
+  let node: unknown;
+  try {
+    node = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+
+  let message: string | undefined;
+  let code: number | undefined;
+
+  while (true) {
+    const obj = asJsonObject(node);
+    if (!obj) {
+      break;
+    }
+    const target = asJsonObject(obj.error) ?? obj;
+    if (typeof target.code === "number") {
+      code = target.code;
+    }
+    if (typeof target.message !== "string") {
+      break;
+    }
+    message = target.message;
+    try {
+      node = JSON.parse(target.message.trim());
+    } catch {
+      break;
+    }
+  }
+
+  return message === undefined ? undefined : { message: message.trim(), code };
+}
+
+/**
+ * Rebuild an SDK error around its extracted nested message, preserving the
+ * HTTP status. Returns the original error untouched when there is nothing
+ * to extract — never masks or degrades an unrecognized error.
+ */
+function normalizeGeminiError(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return error;
+  }
+  const extracted = extractNestedGeminiError(error.message);
+  if (extracted === undefined) {
+    return error;
+  }
+  const status =
+    "status" in error && typeof error.status === "number"
+      ? error.status
+      : extracted.code;
+  const normalized: Error & { status?: number; cause?: unknown } = new Error(
+    extracted.message,
+  );
+  normalized.status = status;
+  normalized.cause = error;
+  return normalized;
+}
+
 export class GeminiApi implements BaseLlmApi {
   apiBase: string = "https://generativelanguage.googleapis.com/v1beta/";
   private genAI: GoogleGenAI;
@@ -79,6 +192,7 @@ export class GeminiApi implements BaseLlmApi {
       () =>
         new GoogleGenAI({
           apiKey: this.config.apiKey,
+          httpOptions: buildGoogleGenAIHttpOptions(this.config),
         }),
     );
   }
@@ -403,9 +517,11 @@ export class GeminiApi implements BaseLlmApi {
     model: string,
     convertedBody: ReturnType<typeof this._convertBody>,
   ) {
-    // Use native fetch temporarily for stream operation to get proper ReadableStream
-    // The withNativeFetch wrapper restores native fetch, makes the call, then reverts
-    return withNativeFetch(() =>
+    // Run the SDK call under a fetch matching this config: native fetch for
+    // default configs (proper ReadableStream, restored after the call), or a
+    // customFetch-backed fetch honoring proxy/TLS requestOptions with its
+    // node-fetch Response adapted back to a native one for SDK streaming.
+    return withRequestOptionsFetch(this.config.requestOptions, () =>
       genAI.models.generateContentStream({
         model,
         contents: convertedBody.contents,
@@ -422,30 +538,42 @@ export class GeminiApi implements BaseLlmApi {
     body: ChatCompletionCreateParamsStreaming,
     _signal: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const convertedBody = this._convertBody(
-      body,
-      this.apiBase.includes("/v1/"),
-      true,
-    );
-    const response = await this.generateStream(
-      this.genAI,
-      body.model,
-      convertedBody,
-    );
-    yield* this.processStreamResponse(response, body.model);
+    try {
+      const convertedBody = this._convertBody(
+        body,
+        this.apiBase.includes("/v1/"),
+        true,
+      );
+      const response = await this.generateStream(
+        this.genAI,
+        body.model,
+        convertedBody,
+      );
+      yield* this.processStreamResponse(response, body.model);
+    } catch (error) {
+      // Surface the nested Gemini message (issue #12945 class of failures);
+      // unrecognized errors are rethrown untouched.
+      throw normalizeGeminiError(error);
+    }
   }
 
   async *streamWithGenAI(
     genAI: GoogleGenAI,
     body: ChatCompletionCreateParamsStreaming,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const convertedBody = this._convertBody(body, false, true);
-    const response = await this.generateStream(
-      genAI,
-      body.model,
-      convertedBody,
-    );
-    yield* this.processStreamResponse(response, body.model);
+    try {
+      const convertedBody = this._convertBody(body, false, true);
+      const response = await this.generateStream(
+        genAI,
+        body.model,
+        convertedBody,
+      );
+      yield* this.processStreamResponse(response, body.model);
+    } catch (error) {
+      // Same normalization as chatCompletionStream — this entry point serves
+      // Vertex AI's Gemini models, which hit the identical error surface.
+      throw normalizeGeminiError(error);
+    }
   }
 
   completionNonStream(
@@ -469,13 +597,20 @@ export class GeminiApi implements BaseLlmApi {
 
   async embed(body: EmbeddingCreateParams): Promise<CreateEmbeddingResponse> {
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
+    // The Gemini REST resource is `models/{model}` — normalize bare model
+    // names to that form. Without the `models/` path segment, a bare name
+    // like `gemini-embedding-001:batchEmbedContents` parses as an absolute
+    // URL whose scheme is the model name, silently discarding apiBase.
+    const model = body.model.startsWith("models/")
+      ? body.model
+      : `models/${body.model}`;
     const response = await customFetch(this.config.requestOptions)(
-      new URL(`${body.model}:batchEmbedContents`, this.apiBase),
+      new URL(`${model}:batchEmbedContents`, this.apiBase),
       {
         method: "POST",
         body: JSON.stringify({
           requests: inputs.map((input) => ({
-            model: body.model,
+            model,
             content: {
               role: "user",
               parts: [{ text: input }],
