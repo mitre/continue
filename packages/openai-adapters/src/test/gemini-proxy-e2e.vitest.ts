@@ -72,9 +72,11 @@ beforeAll(async () => {
  * pipes the response back. onRequest fires for every transit — the
  * discriminating signal for which proxy (if any) a request dialed.
  */
-function makeForwardProxy(onRequest: () => void): http.Server {
+function makeForwardProxy(
+  onRequest: (req: http.IncomingMessage) => void,
+): http.Server {
   return http.createServer((req, res) => {
-    onRequest();
+    onRequest(req);
     const target = new URL(req.url ?? "");
     const upstream = http.request(
       {
@@ -308,6 +310,69 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
     }
   });
 
+  it("isolates proxy routing and credentials between two concurrent configs", async () => {
+    // The security-critical case: two GeminiApi configs, each behind its own
+    // proxy with its own gateway credential, run concurrently. Each request
+    // must stay on its own proxy carrying only its own credential — never
+    // config A's credential riding config B's request (the leak the swap
+    // mutex prevents).
+    const proxyAHeaders: (string | undefined)[] = [];
+    const proxyBHeaders: (string | undefined)[] = [];
+    const proxyA = makeForwardProxy((req) =>
+      proxyAHeaders.push(req.headers["x-custom-gateway"] as string | undefined),
+    );
+    const proxyB = makeForwardProxy((req) =>
+      proxyBHeaders.push(req.headers["x-custom-gateway"] as string | undefined),
+    );
+    await new Promise<void>((r) => proxyA.listen(0, "127.0.0.1", r));
+    await new Promise<void>((r) => proxyB.listen(0, "127.0.0.1", r));
+    const portA = (proxyA.address() as AddressInfo).port;
+    const portB = (proxyB.address() as AddressInfo).port;
+
+    async function drain(port: number, credential: string): Promise<string> {
+      const api = new GeminiApi({
+        provider: "gemini",
+        apiKey: "stub-key",
+        apiBase: `http://127.0.0.1:${geminiPort}/v1beta/`,
+        requestOptions: {
+          proxy: `http://127.0.0.1:${port}`,
+          headers: { "x-custom-gateway": credential },
+        },
+      });
+      let content = "";
+      for await (const chunk of api.chatCompletionStream(
+        {
+          model: "gemini-2.5-flash",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        },
+        new AbortController().signal,
+      )) {
+        content += chunk.choices[0]?.delta?.content ?? "";
+      }
+      return content;
+    }
+
+    try {
+      const [ca, cb] = await Promise.all([
+        drain(portA, "cred-A"),
+        drain(portB, "cred-B"),
+      ]);
+
+      // Both streams completed concurrently (Promise.all) — serialization did
+      // not hold across body consumption.
+      expect(ca).toBe("Hello from the proxied stub");
+      expect(cb).toBe("Hello from the proxied stub");
+      // Each request transited ONLY its own proxy, carrying ONLY its own
+      // credential — zero cross-contamination.
+      expect(proxyAHeaders).toEqual(["cred-A"]);
+      expect(proxyBHeaders).toEqual(["cred-B"]);
+    } finally {
+      await new Promise((r) => proxyA.close(r));
+      await new Promise((r) => proxyB.close(r));
+    }
+  });
+
   it("routes embed through the same proxy and parses Google's real shape", async () => {
     const proxiedBefore = proxiedRequests;
     const requestsBefore = geminiRequests.length;
@@ -328,5 +393,57 @@ describe("Gemini streaming through a real local proxy (no mocks)", () => {
     expect(proxiedRequests).toBe(proxiedBefore + 1);
     expect(geminiRequests[requestsBefore].url).toContain("mbedContent");
     expect(result.data[0].embedding).toEqual([0.25, 0.75]);
+  });
+});
+
+describe("Gemini requestOptions.timeout end-to-end (no mocks)", () => {
+  let slowServer: http.Server;
+  let slowPort: number;
+
+  beforeAll(async () => {
+    // Never responds within the test's timeout window — forces the SDK's
+    // own timeout/abort path to fire.
+    slowServer = http.createServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end();
+      }, 5000);
+    });
+    await new Promise<void>((r) => slowServer.listen(0, "127.0.0.1", r));
+    slowPort = (slowServer.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise((r) => slowServer.close(r));
+  });
+
+  it("aborts a chat call when the configured timeout elapses", async () => {
+    const api = new GeminiApi({
+      provider: "gemini",
+      apiKey: "stub-key",
+      apiBase: `http://127.0.0.1:${slowPort}/v1beta/`,
+      requestOptions: { timeout: 100 },
+    });
+
+    const started = Date.now();
+    let threw = false;
+    try {
+      for await (const _chunk of api.chatCompletionStream(
+        {
+          model: "gemini-2.5-flash",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        },
+        new AbortController().signal,
+      )) {
+        // never arrives
+      }
+    } catch {
+      threw = true;
+    }
+
+    // The call aborted from the timeout, not by waiting out the 5s server.
+    expect(threw).toBe(true);
+    expect(Date.now() - started).toBeLessThan(4000);
   });
 });

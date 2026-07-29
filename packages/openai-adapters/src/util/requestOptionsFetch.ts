@@ -75,15 +75,51 @@ export function adaptToNativeResponse(response: {
 }
 
 /**
+ * Serializes the global-fetch swap window across concurrent callers.
+ *
+ * The swapped `globalThis.fetch` is bound by closure to ONE config's
+ * requestOptions (its proxy Agent, client certificate, and headers). Without
+ * serialization, two concurrent Gemini calls with different configs race on
+ * the shared global — config A's gateway credential / mTLS identity could
+ * ride config B's request (chat behind a corporate gateway + concurrent
+ * embedding indexing is a normal Continue pattern). This mutex admits one
+ * swap window at a time.
+ *
+ * Only the swap window (call establishment) is held: `body` resolves once the
+ * SDK's stream is established, before body iteration, so streams still run
+ * concurrently after the lock is released. The tail promise is always
+ * released in `finally`, including when `body` throws.
+ */
+let fetchSwapChain: Promise<void> = Promise.resolve();
+
+async function withSerializedFetchSwap<T>(body: () => Promise<T>): Promise<T> {
+  const prior = fetchSwapChain;
+  let release!: () => void;
+  fetchSwapChain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prior;
+  try {
+    return await body();
+  } finally {
+    release();
+  }
+}
+
+/**
  * Run `fn` with globalThis.fetch honoring the given requestOptions.
  *
  * - No proxy/TLS options: delegates to withNativeFetch — byte-identical to
- *   the previous behavior for every existing config.
+ *   the previous behavior for every existing config, and unlocked (the native
+ *   fast path installs no config-bound credentials, so it needs no
+ *   serialization).
  * - Proxy/TLS options present: swaps globalThis.fetch for the duration of
  *   `fn` with a fetch that routes through customFetch(requestOptions)
  *   (proxy, CA bundles, client certs, verifySsl) and adapts its node-fetch
- *   Response to a native one so SDK streaming keeps working. The previous
- *   globals are restored in a finally, including when `fn` throws.
+ *   Response to a native one so SDK streaming keeps working. The swap window
+ *   is serialized (see withSerializedFetchSwap) so concurrent configs cannot
+ *   leak credentials across each other. The previous globals are restored in
+ *   a finally, including when `fn` throws.
  */
 export async function withRequestOptionsFetch<T>(
   requestOptions: RequestOptions | undefined,
@@ -99,22 +135,24 @@ export async function withRequestOptionsFetch<T>(
     return adaptToNativeResponse(response);
   };
 
-  const originalFetch = globalThis.fetch;
-  const originalResponse = globalThis.Response;
-  const originalRequest = globalThis.Request;
-  const originalHeaders = globalThis.Headers;
+  return withSerializedFetchSwap(async () => {
+    const originalFetch = globalThis.fetch;
+    const originalResponse = globalThis.Response;
+    const originalRequest = globalThis.Request;
+    const originalHeaders = globalThis.Headers;
 
-  try {
-    globalThis.fetch = wrappedFetch;
-    globalThis.Response = nativeResponse;
-    globalThis.Request = nativeRequest;
-    globalThis.Headers = nativeHeaders;
+    try {
+      globalThis.fetch = wrappedFetch;
+      globalThis.Response = nativeResponse;
+      globalThis.Request = nativeRequest;
+      globalThis.Headers = nativeHeaders;
 
-    return await fn();
-  } finally {
-    globalThis.fetch = originalFetch;
-    globalThis.Response = originalResponse;
-    globalThis.Request = originalRequest;
-    globalThis.Headers = originalHeaders;
-  }
+      return await fn();
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.Response = originalResponse;
+      globalThis.Request = originalRequest;
+      globalThis.Headers = originalHeaders;
+    }
+  });
 }

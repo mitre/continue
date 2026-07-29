@@ -229,6 +229,83 @@ describe("withRequestOptionsFetch", () => {
       globalThis.Headers = ambient.Headers;
     }
   });
+
+  it("serializes concurrent swaps so one config never observes another's fetch", async () => {
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+    fetchwithRequestOptionsMock.mockResolvedValue(
+      nodeFetchStyleResponse(["ok"], { status: 200, statusText: "OK" }),
+    );
+
+    // Each call records the fetch identity it observes across an await point
+    // (yielding to the event loop mid-window). Without serialization the two
+    // swaps interleave and each sees the OTHER's wrapped fetch installed.
+    async function run(tag: string): Promise<(typeof globalThis.fetch)[]> {
+      const seen: (typeof globalThis.fetch)[] = [];
+      await withRequestOptionsFetch(
+        { proxy: `http://proxy-${tag}.example:8080` },
+        async () => {
+          seen.push(globalThis.fetch);
+          // Yield twice so a sibling swap has every chance to overwrite.
+          await Promise.resolve();
+          await Promise.resolve();
+          seen.push(globalThis.fetch);
+        },
+      );
+      return seen;
+    }
+
+    const [a, b] = await Promise.all([run("a"), run("b")]);
+
+    // Within each call, the fetch identity observed before and after the
+    // await must be stable — never swapped out from under it by the sibling.
+    expect(a[0]).toBe(a[1]);
+    expect(b[0]).toBe(b[1]);
+    // And the two calls must have observed DIFFERENT wrapped fetches
+    // (each bound to its own requestOptions), never a shared one.
+    expect(a[0]).not.toBe(b[0]);
+  });
+
+  it("releases the swap lock at establishment, not during stream consumption", async () => {
+    const { withRequestOptionsFetch } = await import(
+      "../util/requestOptionsFetch.js"
+    );
+    fetchwithRequestOptionsMock.mockResolvedValue(
+      nodeFetchStyleResponse(["ok"], { status: 200, statusText: "OK" }),
+    );
+
+    // `fn` resolves when the SDK stream is ESTABLISHED; body iteration happens
+    // afterward, outside withRequestOptionsFetch. Model that: config A's
+    // establishment resolves immediately, then a pending "stream" continues.
+    // Config B must be able to acquire the lock and run WHILE A's stream is
+    // still in flight — proving the lock covers only establishment.
+    let bRanWhileAStreaming = false;
+    let resolveAStream!: () => void;
+    const aStreamDone = new Promise<void>((r) => {
+      resolveAStream = r;
+    });
+
+    const aChain = withRequestOptionsFetch(
+      { proxy: "http://proxy-a.example:8080" },
+      async () => {
+        /* establishment completes — lock should release here */
+      },
+    ).then(() => aStreamDone); // post-establishment stream consumption
+
+    await withRequestOptionsFetch(
+      { proxy: "http://proxy-b.example:8080" },
+      async () => {
+        bRanWhileAStreaming = true;
+      },
+    );
+
+    // B completed while A's stream is still pending (aStreamDone unresolved).
+    expect(bRanWhileAStreaming).toBe(true);
+
+    resolveAStream();
+    await aChain;
+  });
 });
 
 describe("GeminiApi SDK-call fetch routing", () => {
